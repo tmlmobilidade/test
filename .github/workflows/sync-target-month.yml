@@ -17,7 +17,7 @@ jobs:
       PROJECT_OWNER: ${{ vars.PROJECT_OWNER }}
       PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
       GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
-      DATE_FIELD_NAME: Target date
+      DATE_FIELD_NAME: Planned date
       MONTH_FIELD_NAME: Target month
     steps:
       - name: Validate configuration
@@ -62,7 +62,7 @@ jobs:
           echo "project_id=$(jq -r '.data.organization.projectV2.id' project.json)" >> "$GITHUB_OUTPUT"
           test "$(jq -r '.data.organization.projectV2.id' project.json)" != "null" || { echo "::error::Project not found."; exit 1; }
 
-      - name: Set Target date and Target month
+      - name: Set planned date and target month
         run: |
           project_id="${{ steps.project.outputs.project_id }}"
           date_field_id="$(jq -r --arg name "$DATE_FIELD_NAME" '.data.organization.projectV2.fields.nodes[] | select(.name == $name) | .id' project.json)"
