@@ -1,0 +1,97 @@
+name: Sync target month in GitHub Projects
+
+on:
+  schedule:
+    # Reconcile nightly; Project field edits do not emit a GitHub Actions event.
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-target-month:
+    runs-on: ubuntu-latest
+    env:
+      # Configure these repository variables before the first run.
+      PROJECT_OWNER: ${{ vars.PROJECT_OWNER }}
+      PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+      GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+      DATE_FIELD_NAME: Target date
+      MONTH_FIELD_NAME: Target month
+    steps:
+      - name: Validate configuration
+        run: |
+          test -n "$PROJECT_OWNER" || { echo "::error::Set the PROJECT_OWNER repository variable."; exit 1; }
+          test -n "$PROJECT_NUMBER" || { echo "::error::Set the PROJECT_NUMBER repository variable."; exit 1; }
+          test -n "$GH_TOKEN" || { echo "::error::Create the PROJECTS_TOKEN secret with project read/write access."; exit 1; }
+
+      - name: Read project fields and items
+        id: project
+        run: |
+          query='query($owner: String!, $number: Int!) {
+            organization(login: $owner) {
+              projectV2(number: $number) {
+                id
+                fields(first: 100) {
+                  nodes {
+                    ... on ProjectV2FieldCommon { id name dataType }
+                    ... on ProjectV2SingleSelectField {
+                      id
+                      name
+                      dataType
+                      options { id name }
+                    }
+                  }
+                }
+                items(first: 100) {
+                  nodes {
+                    id
+                    fieldValueByName(name: "Target date") {
+                      ... on ProjectV2ItemFieldDateValue { date }
+                    }
+                  }
+                }
+              }
+            }
+          }'
+          gh api graphql -f query="$query" -f owner="$PROJECT_OWNER" -F number="$PROJECT_NUMBER" > project.json
+          echo "project_id=$(jq -r '.data.organization.projectV2.id' project.json)" >> "$GITHUB_OUTPUT"
+          test "$(jq -r '.data.organization.projectV2.id' project.json)" != "null" || { echo "::error::Project not found."; exit 1; }
+
+      - name: Set Target month from Target date
+        run: |
+          project_id="${{ steps.project.outputs.project_id }}"
+          month_field_id="$(jq -r --arg name "$MONTH_FIELD_NAME" '.data.organization.projectV2.fields.nodes[] | select(.name == $name) | .id' project.json)"
+          test -n "$month_field_id" && test "$month_field_id" != "null" || {
+            echo "::error::Create a single-select field named '$MONTH_FIELD_NAME'."; exit 1;
+          }
+
+          jq -r '.data.organization.projectV2.items.nodes[] | [.id, (.fieldValueByName.date // "")] | @tsv' project.json |
+          while IFS=$'\t' read -r item_id target_date; do
+            test -n "$target_date" || continue
+            month="$(date -d "$target_date" +%Y-%m)"
+            option_id="$(jq -r --arg field "$month_field_id" --arg month "$month" '
+              .data.organization.projectV2.fields.nodes[]
+              | select(.id == $field)
+              | .options[]
+              | select(.name == $month)
+              | .id
+            ' project.json)"
+
+            if test -z "$option_id" || test "$option_id" = "null"; then
+              echo "::warning title=Missing month option::Add '$month' to the $MONTH_FIELD_NAME field; item $item_id was skipped."
+              continue
+            fi
+
+            mutation='mutation($project: ID!, $item: ID!, $field: ID!, $option: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $project
+                itemId: $item
+                fieldId: $field
+                value: { singleSelectOptionId: $option }
+              }) { projectV2Item { id } }
+            }'
+            gh api graphql -f query="$mutation" \
+              -f project="$project_id" -f item="$item_id" -f field="$month_field_id" -f option="$option_id" --silent
+          done
